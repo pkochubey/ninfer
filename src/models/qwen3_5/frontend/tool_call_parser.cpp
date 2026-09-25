@@ -3,6 +3,8 @@
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
+#include <array>
+#include <limits>
 #include <stdexcept>
 #include <string_view>
 #include <utility>
@@ -17,8 +19,18 @@ using NormalizationPolicy = Contract::NormalizationPolicy;
 using SchemaType          = Contract::SchemaType;
 using TypeSet             = Contract::TypeSet;
 
-constexpr std::string_view kToolOpen      = "<tool_call>";
-constexpr std::string_view kToolClose     = "</tool_call>";
+constexpr std::string_view kToolOpen          = "<tool_call>";
+constexpr std::string_view kToolClose         = "</tool_call>";
+constexpr std::string_view kFunctionCallsOpen = "<function_calls>";
+constexpr std::string_view kFunctionCallsClose = "</function_calls>";
+constexpr std::string_view kFunctionOpen      = "<function";
+constexpr std::string_view kFunctionClose     = "</function>";
+constexpr std::string_view kInvokeOpen        = "<invoke";
+constexpr std::string_view kInvokeClose       = "</invoke>";
+constexpr std::string_view kParamOpen         = "<param";
+constexpr std::string_view kParamClose        = "</param>";
+constexpr std::string_view kParameterOpen     = "<parameter";
+constexpr std::string_view kParameterClose    = "</parameter>";
 
 struct RawParameter {
     std::string_view name;
@@ -28,6 +40,13 @@ struct RawParameter {
 struct RawToolCall {
     std::string_view name;
     std::vector<RawParameter> parameters;
+};
+
+struct ParsedToolRegion {
+    std::vector<RawToolCall> calls;
+    std::string_view visible_suffix;
+    std::size_t suppressed_marker_bytes = 0;
+    FallbackReason reason                = FallbackReason::None;
 };
 
 enum class JsonValueKind : std::uint8_t {
@@ -541,40 +560,82 @@ public:
                          const Contract& contract)
         : text_(text), max_name_length_(max_name_length), contract_(contract) {}
 
-    FallbackReason parse(std::vector<RawToolCall>& calls) const {
+    ParsedToolRegion parse() const {
+        ParsedToolRegion result;
         std::size_t pos = 0;
         for (;;) {
+            const std::size_t separator_begin = pos;
             skip_format_whitespace(text_, pos);
             if (pos == text_.size()) {
-                return calls.empty() ? FallbackReason::MalformedStructure : FallbackReason::None;
+                if (result.calls.empty()) {
+                    result.reason                  = FallbackReason::MalformedStructure;
+                    result.suppressed_marker_bytes = text_.size();
+                }
+                return result;
             }
             if (starts_with_at(text_, pos, "<tool_call>")) {
+                const std::size_t call_begin = pos;
                 RawToolCall call;
                 const FallbackReason failure = parse_tool_call(pos, call);
-                if (failure != FallbackReason::None) { return failure; }
-                calls.push_back(std::move(call));
+                if (failure != FallbackReason::None) {
+                    result.reason                  = failure;
+                    result.suppressed_marker_bytes = text_.size() - call_begin;
+                    return result;
+                }
+                result.calls.push_back(std::move(call));
             } else if (starts_with_at(text_, pos, "<function_calls>")) {
+                const std::size_t call_begin = pos;
                 pos += 16;
                 bool had_calls = false;
+                FallbackReason failure = FallbackReason::None;
                 for (;;) {
                     skip_format_whitespace(text_, pos);
                     if (consume(pos, "</function_calls>")) { break; }
-                    if (pos == text_.size()) { return FallbackReason::MalformedStructure; }
+                    if (pos == text_.size()) {
+                        failure = FallbackReason::MalformedStructure;
+                        break;
+                    }
                     RawToolCall call;
-                    const FallbackReason failure = parse_function(pos, call);
-                    if (failure != FallbackReason::None) { return failure; }
-                    calls.push_back(std::move(call));
+                    failure = parse_function(pos, call);
+                    if (failure != FallbackReason::None) { break; }
+                    result.calls.push_back(std::move(call));
                     had_calls = true;
                 }
-                if (!had_calls) { return FallbackReason::MalformedStructure; }
-            } else if (starts_with_at(text_, pos, "<function") || starts_with_at(text_, pos, "<invoke")) {
+                if (failure != FallbackReason::None || !had_calls) {
+                    result.reason = (failure != FallbackReason::None)
+                                        ? failure
+                                        : FallbackReason::MalformedStructure;
+                    result.suppressed_marker_bytes = text_.size() - call_begin;
+                    return result;
+                }
+            } else if (starts_with_at(text_, pos, "<function") ||
+                       starts_with_at(text_, pos, "<invoke")) {
+                const std::size_t call_begin = pos;
                 RawToolCall call;
                 const FallbackReason failure = parse_function(pos, call);
-                if (failure != FallbackReason::None) { return failure; }
-                calls.push_back(std::move(call));
+                if (failure != FallbackReason::None) {
+                    result.reason                  = failure;
+                    result.suppressed_marker_bytes = text_.size() - call_begin;
+                    return result;
+                }
+                result.calls.push_back(std::move(call));
             } else {
-                return calls.empty() ? FallbackReason::MalformedStructure
-                                     : FallbackReason::TrailingContent;
+                result.reason = result.calls.empty() ? FallbackReason::MalformedStructure
+                                                     : FallbackReason::TrailingContent;
+                if (result.calls.empty()) {
+                    result.suppressed_marker_bytes = text_.size() - pos;
+                    return result;
+                }
+
+                const std::size_t rejected = find_tool_markup(pos);
+                const std::size_t suffix_end =
+                    rejected == std::string_view::npos ? text_.size() : rejected;
+                result.visible_suffix =
+                    text_.substr(separator_begin, suffix_end - separator_begin);
+                if (rejected != std::string_view::npos) {
+                    result.suppressed_marker_bytes = text_.size() - rejected;
+                }
+                return result;
             }
         }
     }
@@ -584,6 +645,32 @@ private:
         if (!starts_with_at(text_, pos, token)) { return false; }
         pos += token.size();
         return true;
+    }
+
+    std::size_t find_tool_markup(std::size_t begin) const {
+        constexpr std::array markers = {kToolOpen,          kToolClose,          kFunctionOpen,
+                                        kFunctionClose,     kParamOpen,          kParamClose,
+                                        kFunctionCallsOpen, kFunctionCallsClose, kInvokeOpen,
+                                        kInvokeClose,       kParameterOpen,      kParameterClose};
+        std::size_t first = std::string_view::npos;
+        for (const std::string_view marker : markers) {
+            first = std::min(first, text_.find(marker, begin));
+        }
+
+        // Preserve ordinary suffix prose, but treat a terminal partial marker as unsafe output
+        // from a truncated second call. Require five bytes to avoid classifying normal '<' text.
+        std::size_t candidate = text_.find('<', begin);
+        while (candidate != std::string_view::npos) {
+            const std::string_view suffix = text_.substr(candidate);
+            if (suffix.size() >= 5 &&
+                std::any_of(markers.begin(), markers.end(),
+                            [&](std::string_view marker) { return marker.starts_with(suffix); })) {
+                first = std::min(first, candidate);
+                break;
+            }
+            candidate = text_.find('<', candidate + 1);
+        }
+        return first;
     }
 
     FallbackReason parse_tool_call(std::size_t& pos, RawToolCall& call) const {
@@ -752,6 +839,11 @@ ParsedToolCallOutput fallback(const std::string& text, ToolCallParseDiagnostics 
     return out;
 }
 
+std::uint32_t diagnostic_byte_count(std::size_t bytes) {
+    return static_cast<std::uint32_t>(
+        std::min(bytes, static_cast<std::size_t>(std::numeric_limits<std::uint32_t>::max())));
+}
+
 } // namespace
 
 std::shared_ptr<const ToolCallOutputContract>
@@ -777,21 +869,28 @@ ParsedToolCallOutput parse_qwen_tool_call_output(const std::string& text,
     out.content                 = rtrim_format_whitespace(std::string_view(text).substr(0, first));
     out.diagnostics.marker_seen = true;
 
-    std::vector<RawToolCall> raw_calls;
     const std::string_view tool_region = std::string_view(text).substr(first);
     const QwenToolRegionParser parser(tool_region, max_tool_name_length, contract);
-    const FallbackReason failure = parser.parse(raw_calls);
-    if (failure != FallbackReason::None) {
-        out.diagnostics.fallback_reason = failure;
-        return fallback(text, out.diagnostics);
+    ParsedToolRegion parsed = parser.parse();
+    out.content.append(parsed.visible_suffix);
+    out.diagnostics.suppressed_marker_bytes =
+        diagnostic_byte_count(parsed.suppressed_marker_bytes);
+
+    if (parsed.calls.empty()) {
+        out.diagnostics.fallback_reason = parsed.reason;
+        return out;
     }
 
-    out.tool_calls.reserve(raw_calls.size());
-    for (const RawToolCall& raw : raw_calls) {
+    out.tool_calls.reserve(parsed.calls.size());
+    for (const RawToolCall& raw : parsed.calls) {
         out.tool_calls.push_back(normalize_raw_tool_call(raw, contract, out.diagnostics));
     }
 
     out.diagnostics.structured_call_count = static_cast<std::uint32_t>(out.tool_calls.size());
+    if (parsed.reason != FallbackReason::None) {
+        out.diagnostics.recovered_call_count = out.diagnostics.structured_call_count;
+        out.diagnostics.recovery_reason      = parsed.reason;
+    }
     out.is_tool_call_response             = true;
     return out;
 }
@@ -852,11 +951,12 @@ ToolCallOutputDecoder::Terminal ToolCallOutputDecoder::finish() {
 
     ParsedToolCallOutput parsed =
         parse_qwen_tool_call_output(tool_region_, max_tool_name_length_, *contract_);
-    if (saw_tool_marker_ && parsed.is_tool_call_response) {
+    if (saw_tool_marker_) {
         trailing_whitespace_.clear();
         tool_region_.clear();
         pending_tag_.clear();
-        return Terminal{.content     = {},
+        marker_prefix_bytes_ = 0;
+        return Terminal{.content     = std::move(parsed.content),
                         .tool_calls  = std::move(parsed.tool_calls),
                         .diagnostics = parsed.diagnostics};
     }
